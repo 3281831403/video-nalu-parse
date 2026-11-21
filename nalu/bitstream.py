@@ -33,6 +33,93 @@ class NaluError(ValueError):
 # validate_stream.  The value is part of the public contract.
 MAX_NAL_BYTES = 4 * 1024 * 1024
 
+# profile_idc values whose SPS carries chroma_format_idc and the
+# high-profile-only fields (scaling lists, bit depths).
+_HIGH_PROFILES = frozenset(
+    {100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135}
+)
+
+# chroma_format_idc -> (SubWidthC, SubHeightC)
+_SUB_WIDTH_HEIGHT = {
+    0: (1, 1),  # monochrome (ChromaArrayType == 0)
+    1: (2, 2),  # 4:2:0
+    2: (2, 1),  # 4:2:2
+    3: (1, 1),  # 4:4:4
+}
+
+
+class _BitReader:
+    """MSB-first bit reader over an RBSP, raising NaluError on truncation."""
+
+    __slots__ = ("_data", "_bit")
+
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+        self._bit = 0
+
+    def _read_bit(self) -> int:
+        index = self._bit >> 3
+        if index >= len(self._data):
+            raise NaluError("truncated bitstream")
+        value = (self._data[index] >> (7 - (self._bit & 7))) & 1
+        self._bit += 1
+        return value
+
+    def read_bits(self, count: int) -> int:
+        if count < 0:
+            raise NaluError("negative bit count")
+        value = 0
+        for _ in range(count):
+            value = (value << 1) | self._read_bit()
+        return value
+
+    def read_flag(self) -> bool:
+        return bool(self._read_bit())
+
+    def read_ue(self) -> int:
+        zeros = 0
+        while self._read_bit() == 0:
+            zeros += 1
+            if zeros > 31:
+                raise NaluError("invalid Exp-Golomb code")
+        if zeros == 0:
+            return 0
+        return (1 << zeros) - 1 + self.read_bits(zeros)
+
+    def read_se(self) -> int:
+        code_num = self.read_ue()
+        if code_num & 1:
+            return (code_num + 1) >> 1
+        return -(code_num >> 1)
+
+
+def _skip_scaling_list(reader: _BitReader, size: int) -> None:
+    last_scale = 8
+    next_scale = 8
+    for _ in range(size):
+        if next_scale != 0:
+            next_scale = (last_scale + reader.read_se() + 256) % 256
+        if next_scale != 0:
+            last_scale = next_scale
+
+
+def _split_rbsp(nal: bytes) -> bytes:
+    """Return the de-escaped RBSP for a NAL payload (header byte included)."""
+    return strip_emulation(nal)
+
+
+def _payload_type(nal: bytes) -> int:
+    """Raw ``header & 0x1F`` without the forbidden-type check."""
+    return nal[0] & 0x1F
+
+
+def _require_type(nal: bytes, expected: int, kind: str) -> None:
+    if not nal:
+        raise NaluError(f"empty {kind} NAL")
+    actual = nal_type(nal)
+    if actual != expected:
+        raise NaluError(f"{kind} NAL has nal_unit_type {actual}, expected {expected}")
+
 
 def split_nals(data: bytes) -> list[bytes]:
     """Split an Annex B byte stream into NAL payloads.
@@ -53,7 +140,37 @@ def split_nals(data: bytes) -> list[bytes]:
     comparisons allow a one-byte difference for that padding.
     """
 
-    raise NotImplementedError
+    if not data:
+        return []
+
+    # Locate every start code: 00 00 01, with any extra leading zero bytes
+    # (four-byte start code and trailing_zero_8bits) treated as delimiter.
+    starts: list[tuple[int, int]] = []
+    i = 0
+    n = len(data)
+    while i + 2 < n:
+        if data[i] == 0 and data[i + 1] == 0 and data[i + 2] == 1:
+            prefix = i
+            while prefix > 0 and data[prefix - 1] == 0:
+                prefix -= 1
+            starts.append((prefix, i))
+            i += 3
+        else:
+            i += 1
+
+    if not starts:
+        raise NaluError("data does not start with an Annex B start code")
+    if starts[0][0] != 0:
+        raise NaluError("data does not start with an Annex B start code")
+
+    nals: list[bytes] = []
+    for index, (_, payload_start) in enumerate(starts):
+        if index + 1 < len(starts):
+            end = starts[index + 1][0]
+        else:
+            end = n
+        nals.append(data[payload_start + 3 : end])
+    return nals
 
 
 def nal_type(nal: bytes) -> int:
@@ -68,7 +185,12 @@ def nal_type(nal: bytes) -> int:
     continue parsing a type-0 NAL as though it had a defined layout.
     """
 
-    raise NotImplementedError
+    if not nal:
+        raise NaluError("empty NAL payload")
+    value = nal[0] & 0x1F
+    if value == 0:
+        raise NaluError("forbidden nal_unit_type 0")
+    return value
 
 
 def strip_emulation(nal: bytes) -> bytes:
@@ -86,7 +208,17 @@ def strip_emulation(nal: bytes) -> bytes:
     exact inverse.  Empty input returns ``b""``.
     """
 
-    raise NotImplementedError
+    out = bytearray()
+    i = 0
+    n = len(nal)
+    while i < n:
+        if i + 2 < n and nal[i] == 0 and nal[i + 1] == 0 and nal[i + 2] == 3:
+            out += b"\x00\x00"
+            i += 3
+        else:
+            out.append(nal[i])
+            i += 1
+    return bytes(out)
 
 
 def insert_emulation(rbsp: bytes) -> bytes:
@@ -103,7 +235,18 @@ def insert_emulation(rbsp: bytes) -> bytes:
     The input is not mutated; empty input returns ``b""``.
     """
 
-    raise NotImplementedError
+    out = bytearray()
+    zeros = 0
+    for byte in rbsp:
+        if zeros >= 2 and byte <= 3:
+            out.append(3)
+            zeros = 0
+        out.append(byte)
+        if byte == 0:
+            zeros += 1
+        else:
+            zeros = 0
+    return bytes(out)
 
 
 def parse_sps(nal: bytes) -> dict:
@@ -138,7 +281,95 @@ def parse_sps(nal: bytes) -> dict:
     tolerance applies to them.
     """
 
-    raise NotImplementedError
+    _require_type(nal, 7, "SPS")
+    reader = _BitReader(_split_rbsp(nal))
+    reader.read_bits(8)  # NAL header byte
+
+    profile_idc = reader.read_bits(8)
+    reader.read_bits(8)  # constraint_set flags + reserved bits
+    level_idc = reader.read_bits(8)
+    sps_id = reader.read_ue()
+
+    chroma_format_idc = 1
+    if profile_idc in _HIGH_PROFILES:
+        chroma_format_idc = reader.read_ue()
+        if chroma_format_idc > 3:
+            raise NaluError("invalid chroma_format_idc")
+        if chroma_format_idc == 3:
+            reader.read_flag()  # separate_colour_plane_flag
+        reader.read_ue()  # bit_depth_luma_minus8
+        reader.read_ue()  # bit_depth_chroma_minus8
+        reader.read_flag()  # qpprime_y_zero_transform_bypass_flag
+        if reader.read_flag():  # seq_scaling_matrix_present_flag
+            count = 12 if chroma_format_idc == 3 else 8
+            for i in range(count):
+                if reader.read_flag():  # seq_scaling_list_present_flag[i]
+                    _skip_scaling_list(reader, 16 if i < 6 else 64)
+
+    reader.read_ue()  # log2_max_frame_num_minus4
+    pic_order_cnt_type = reader.read_ue()
+    if pic_order_cnt_type == 0:
+        reader.read_ue()  # log2_max_pic_order_cnt_lsb_minus4
+    elif pic_order_cnt_type == 1:
+        reader.read_flag()  # delta_pic_order_always_zero_flag
+        reader.read_se()  # offset_for_non_ref_pic
+        reader.read_se()  # offset_for_top_to_bottom_field
+        cycle = reader.read_ue()
+        for _ in range(cycle):
+            reader.read_se()  # offset_for_ref_frame[i]
+    elif pic_order_cnt_type != 2:
+        raise NaluError("invalid pic_order_cnt_type")
+
+    reader.read_ue()  # max_num_ref_frames
+    reader.read_flag()  # gaps_in_frame_num_value_allowed_flag
+
+    pic_width_in_mbs_minus1 = reader.read_ue()
+    pic_height_in_map_units_minus1 = reader.read_ue()
+    frame_mbs_only_flag = reader.read_flag()
+    if not frame_mbs_only_flag:
+        reader.read_flag()  # mb_adaptive_frame_field_flag
+    reader.read_flag()  # direct_8x8_inference_flag
+
+    frame_cropping_flag = reader.read_flag()
+    crop_left = crop_right = crop_top = crop_bottom = 0
+    if frame_cropping_flag:
+        crop_left = reader.read_ue()
+        crop_right = reader.read_ue()
+        crop_top = reader.read_ue()
+        crop_bottom = reader.read_ue()
+
+    width = (pic_width_in_mbs_minus1 + 1) * 16
+    height = (2 - int(frame_mbs_only_flag)) * (
+        pic_height_in_map_units_minus1 + 1
+    ) * 16
+
+    if chroma_format_idc == 0:
+        crop_unit_x = 1
+        crop_unit_y = 2 - int(frame_mbs_only_flag)
+    else:
+        sub_width_c, sub_height_c = _SUB_WIDTH_HEIGHT[chroma_format_idc]
+        crop_unit_x = sub_width_c
+        crop_unit_y = sub_height_c * (2 - int(frame_mbs_only_flag))
+
+    width -= (crop_left + crop_right) * crop_unit_x
+    height -= (crop_top + crop_bottom) * crop_unit_y
+    if width <= 0 or height <= 0:
+        raise NaluError("frame cropping removes the whole picture")
+
+    return {
+        "sps_id": sps_id,
+        "profile_idc": profile_idc,
+        "level_idc": level_idc,
+        "chroma_format_idc": chroma_format_idc,
+        "frame_mbs_only_flag": frame_mbs_only_flag,
+        "width": width,
+        "height": height,
+        "frame_cropping_flag": frame_cropping_flag,
+        "crop_left": crop_left,
+        "crop_right": crop_right,
+        "crop_top": crop_top,
+        "crop_bottom": crop_bottom,
+    }
 
 
 def parse_pps(nal: bytes) -> dict:
@@ -165,7 +396,70 @@ def parse_pps(nal: bytes) -> dict:
     CABAC).  Emulation-prevention bytes are removed before bit parsing.
     """
 
-    raise NotImplementedError
+    _require_type(nal, 8, "PPS")
+    reader = _BitReader(_split_rbsp(nal))
+    reader.read_bits(8)  # NAL header byte
+
+    pps_id = reader.read_ue()
+    sps_id = reader.read_ue()
+    if pps_id > 255:
+        raise NaluError("pic_parameter_set_id out of range")
+    if sps_id > 31:
+        raise NaluError("seq_parameter_set_id out of range")
+
+    entropy_coding_mode_flag = reader.read_flag()
+    bottom_field_pic_order_in_frame_present_flag = reader.read_flag()
+    num_slice_groups_minus1 = reader.read_ue()
+    if num_slice_groups_minus1 > 7:
+        raise NaluError("num_slice_groups_minus1 out of range")
+    if num_slice_groups_minus1 > 0:
+        slice_group_map_type = reader.read_ue()
+        if slice_group_map_type > 6:
+            raise NaluError("invalid slice_group_map_type")
+        if slice_group_map_type == 0:
+            for _ in range(num_slice_groups_minus1 + 1):
+                reader.read_ue()  # run_length_minus1[i]
+        elif slice_group_map_type == 2:
+            for _ in range(num_slice_groups_minus1):
+                reader.read_ue()  # top_left[i]
+                reader.read_ue()  # bottom_right[i]
+        elif slice_group_map_type in (3, 4, 5):
+            reader.read_flag()  # slice_group_change_direction_flag
+            reader.read_ue()  # slice_group_change_rate_minus1
+        elif slice_group_map_type == 6:
+            pic_size_in_map_units_minus1 = reader.read_ue()
+            bits = max(1, (num_slice_groups_minus1).bit_length())
+            for _ in range(pic_size_in_map_units_minus1 + 1):
+                reader.read_bits(bits)  # slice_group_id[i]
+
+    num_ref_idx_l0_default_active_minus1 = reader.read_ue()
+    num_ref_idx_l1_default_active_minus1 = reader.read_ue()
+    weighted_pred_flag = reader.read_flag()
+    weighted_bipred_idc = reader.read_bits(2)
+    reader.read_se()  # pic_init_qp_minus26
+    reader.read_se()  # pic_init_qs_minus26
+    reader.read_se()  # chroma_qp_index_offset
+    reader.read_flag()  # deblocking_filter_control_present_flag
+    reader.read_flag()  # constrained_intra_pred_flag
+    reader.read_flag()  # redundant_pic_cnt_present_flag
+
+    return {
+        "pps_id": pps_id,
+        "sps_id": sps_id,
+        "entropy_coding_mode_flag": entropy_coding_mode_flag,
+        "bottom_field_pic_order_in_frame_present_flag": (
+            bottom_field_pic_order_in_frame_present_flag
+        ),
+        "num_slice_groups_minus1": num_slice_groups_minus1,
+        "num_ref_idx_l0_default_active_minus1": (
+            num_ref_idx_l0_default_active_minus1
+        ),
+        "num_ref_idx_l1_default_active_minus1": (
+            num_ref_idx_l1_default_active_minus1
+        ),
+        "weighted_pred_flag": weighted_pred_flag,
+        "weighted_bipred_idc": weighted_bipred_idc,
+    }
 
 
 def validate_stream(data: bytes) -> list[str]:
@@ -188,7 +482,24 @@ def validate_stream(data: bytes) -> list[str]:
     NAL index.
     """
 
-    raise NotImplementedError
+    if not data:
+        return []
+    try:
+        nals = split_nals(data)
+    except NaluError:
+        return ["missing start code"]
+
+    issues: list[str] = []
+    for index, nal in enumerate(nals):
+        if not nal:
+            issues.append(f"empty NAL at index {index}")
+            continue
+        payload_type = _payload_type(nal)
+        if payload_type == 0:
+            issues.append(f"forbidden nal_unit_type 0 at index {index}")
+        if len(nal) < 2 or len(nal) > MAX_NAL_BYTES:
+            issues.append(f"NAL length out of bounds at index {index}")
+    return issues
 
 
 def parse_batch(streams: list[tuple[str, bytes]]) -> dict:
@@ -221,4 +532,47 @@ def parse_batch(streams: list[tuple[str, bytes]]) -> dict:
     order in both ``order`` and the insertion order of ``streams``.
     """
 
-    raise NotImplementedError
+    if not streams:
+        return {"order": [], "streams": {}}
+
+    seen: set[str] = set()
+    for name, _ in streams:
+        if name in seen:
+            raise NaluError(f"duplicate stream name: {name!r}")
+        seen.add(name)
+
+    staged: dict[str, dict] = {}
+    for name, data in streams:
+        issues = validate_stream(data)
+        if issues:
+            raise NaluError(f"invalid stream {name!r}: {'; '.join(issues)}")
+
+        nals = split_nals(data)
+        nal_types: list[int] = []
+        sps_nals: list[bytes] = []
+        pps_nals: list[bytes] = []
+        for nal in nals:
+            value = nal_type(nal)
+            nal_types.append(value)
+            if value == 7:
+                sps_nals.append(nal)
+            elif value == 8:
+                pps_nals.append(nal)
+
+        if len(sps_nals) != 1:
+            raise NaluError(
+                f"stream {name!r} has {len(sps_nals)} SPS NALs, expected 1"
+            )
+        if len(pps_nals) != 1:
+            raise NaluError(
+                f"stream {name!r} has {len(pps_nals)} PPS NALs, expected 1"
+            )
+
+        # Fresh objects per stream: nothing is shared between entries.
+        staged[name] = {
+            "nal_types": nal_types,
+            "sps": parse_sps(sps_nals[0]),
+            "pps": parse_pps(pps_nals[0]),
+        }
+
+    return {"order": [name for name, _ in streams], "streams": staged}
